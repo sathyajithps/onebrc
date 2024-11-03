@@ -3,4 +3,16 @@ name = "onebrc"
 version = "0.1.0"
 edition = "2021"
 
+[[bin]]
+name = "create"
+path = "src/create.rs"
+
+[[bin]]
+name = "onebrc"
+path = "src/main.rs"
+
+
 [dependencies]
+rand = "0.8.5"
+rand_distr = "0.4.3"
+

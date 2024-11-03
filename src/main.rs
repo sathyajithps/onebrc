@@ -153,10 +153,10 @@ fn main() {
 
             let mut consumed_lines = 0;
 
-            loop {
-                let mut line = String::new();
+            let mut line = String::new();
 
-                let size = match reader.read_line(&mut line) {
+            loop {
+                let size = match reader.read_until(b'\n', unsafe { line.as_mut_vec() }) {
                     Ok(s) => s,
                     _ => panic!("failed to read line"),
                 };
@@ -169,17 +169,22 @@ fn main() {
 
                 consumed_lines += 1;
 
-                let mut split = line[0..(line.len() - 1)].split(';');
+                let mut delim_idx = line.len() - 5;
 
-                let city = match split.next() {
-                    Some(c) => c,
-                    None => panic!("failed to split line"),
-                };
+                let bytes = line.as_bytes();
 
-                let temp = match split.next().map(|t| t.parse::<f32>()) {
-                    Some(Ok(t)) => t,
-                    _ => panic!("failed to split line"),
-                };
+                loop {
+                    if bytes[delim_idx] == b';' {
+                        break;
+                    }
+                    delim_idx -= 1;
+                }
+
+                let city = &line[0..delim_idx];
+
+                let temp = *&line[delim_idx + 1..(line.len() - 1)]
+                    .parse::<f32>()
+                    .unwrap();
 
                 match weather_data.get_mut(city) {
                     Some(entry) => {
@@ -193,13 +198,15 @@ fn main() {
                         entry.3 += 1.0;
                     }
                     None => {
-                        weather_data.insert(city.into(), (temp, temp, temp, 1.0));
+                        weather_data.insert(city.to_string(), (temp, temp, temp, 1.0));
                     }
                 };
 
                 if consumed_bytes == chunk.chunk_size as usize {
                     break;
                 }
+
+                line.clear();
             }
 
             tx.send(ComputeResult {

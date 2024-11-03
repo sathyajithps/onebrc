@@ -1,0 +1,5 @@
+{
+  "scripts": {
+    "release": "cargo build --release && time ./target/release/onebrc"
+  }
+}

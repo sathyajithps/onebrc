@@ -7,7 +7,7 @@ use std::{
 };
 
 // Number of threads that will be spawned to process chunks
-const THREADS: u64 = 255;
+const THREADS: u64 = 13;
 const MEASUREMENT_FILE: &'static str = "measurements.txt";
 
 // Result from each thread
@@ -145,7 +145,7 @@ fn main() {
 
             file.seek(SeekFrom::Start(chunk.start)).unwrap();
 
-            let mut reader = BufReader::with_capacity(8192, file);
+            let mut reader = BufReader::with_capacity(4194304, file);
 
             let mut weather_data = HashMap::<String, (f32, f32, f32, f32)>::new();
 

@@ -119,6 +119,25 @@ fn correct_chunk_position<F: Read + Seek>(file: &mut F, chunks: &mut Vec<ChunkDa
     }
 }
 
+fn string_to_float(s: &[u8]) -> f32 {
+    let (rest, sign) = if s[0] == b'-' {
+        (&s[1..], -1.0_f32)
+    } else {
+        (s, 1.0_f32)
+    };
+
+    let mut value = (rest[0] - b'0') as f32;
+
+    if rest[1] != b'.' {
+        value = value * 10.0 + (rest[1] - b'0') as f32;
+        value += (rest[3] - b'0') as f32 / 10.0;
+    } else {
+        value += (rest[2] - b'0') as f32 / 10.0;
+    }
+
+    value * sign
+}
+
 fn main() {
     let meta = fs::metadata(MEASUREMENT_FILE).unwrap();
 
@@ -182,9 +201,7 @@ fn main() {
 
                 let city = &line[0..delim_idx];
 
-                let temp = *&line[delim_idx + 1..(line.len() - 1)]
-                    .parse::<f32>()
-                    .unwrap();
+                let temp = string_to_float(line[delim_idx + 1..(line.len() - 1)].as_bytes());
 
                 match weather_data.get_mut(city) {
                     Some(entry) => {

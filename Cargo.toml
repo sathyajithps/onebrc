@@ -18,3 +18,7 @@ rand_distr = "0.4.3"
 
 [profile.release]
 lto = true
+
+[profile.profiling]
+inherits = "release"
+debug = 2

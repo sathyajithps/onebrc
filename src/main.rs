@@ -9,13 +9,14 @@ use std::{
 // Number of threads that will be spawned to process chunks
 const THREADS: u64 = 13;
 const MEASUREMENT_FILE: &'static str = "measurements.txt";
+const TOTAL_CITIES: usize = 10_000;
+const BUFF_CAPACITY: usize = 4194304;
 
 // Result from each thread
 struct ComputeResult {
     pub consumed_lines: u64,
     pub consumed_bytes: usize,
-    //                        city     min  sum  max  count
-    pub weather_data: HashMap<String, (f32, f32, f32, f32)>,
+    pub weather_data: WeatherHashMap,
 }
 
 struct ChunkData {
@@ -138,6 +139,102 @@ fn string_to_float(s: &[u8]) -> f32 {
     value * sign
 }
 
+struct StationEntry {
+    min: f32,
+    sum: f32,
+    max: f32,
+    count: f32,
+    // We can use String, but the performance is comparable to using a static buffer.
+    name: [u8; 100],
+    // Why u8? Because we know that the city name will be 100 bytes max.
+    len: u8,
+}
+
+impl StationEntry {
+    const fn new() -> Self {
+        Self {
+            min: 0.0,
+            sum: 0.0,
+            max: 0.0,
+            count: 0.0,
+            name: [0u8; 100],
+            len: 0,
+        }
+    }
+
+    fn name_string(&self) -> &str {
+        unsafe { core::str::from_utf8_unchecked(&self.name[0..self.len as usize]) }
+    }
+}
+
+struct WeatherHashMap {
+    pub data: [StationEntry; TOTAL_CITIES],
+    pub occupied_indexes: Vec<usize>,
+}
+
+impl WeatherHashMap {
+    pub fn new() -> Self {
+        Self {
+            data: [const { StationEntry::new() }; TOTAL_CITIES],
+            occupied_indexes: Vec::new(),
+        }
+    }
+
+    pub fn entry(&mut self, city: &[u8], reading: f32) {
+        let mut index = WeatherHashMap::hash(city);
+
+        let city_len = city.len();
+
+        loop {
+            let entry = unsafe { self.data.get_unchecked_mut(index) };
+            if entry.len == city_len as u8 && &entry.name[..city_len as usize] == city {
+                entry.min = entry.min.min(reading);
+                entry.max = entry.max.max(reading);
+
+                entry.sum += reading;
+                entry.count += 1.0;
+                break;
+            }
+
+            if entry.len == 0 {
+                entry.name[..city_len as usize].copy_from_slice(city);
+                entry.len = city_len as u8;
+                entry.min = reading;
+                entry.sum = reading;
+                entry.max = reading;
+                entry.count = 1.0;
+
+                self.occupied_indexes.push(index);
+
+                break;
+            }
+
+            index += 1;
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn hash(city: &[u8]) -> usize {
+        let mut crc = 0;
+
+        for c in city {
+            crc = unsafe { std::arch::aarch64::__crc32cb(crc, *c) };
+        }
+
+        // To keep the hash in between 0 and 9,999 which is our index range.
+        crc as usize % (TOTAL_CITIES - 1)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn hash(city: &[u8]) -> usize {
+        let mut h = std::hash::DefaultHasher::new();
+
+        std::hash::Hasher::write(&mut h, city);
+
+        std::hash::Hasher::finish(&h) as usize % (TOTAL_CITIES - 1)
+    }
+}
+
 fn main() {
     let meta = fs::metadata(MEASUREMENT_FILE).unwrap();
 
@@ -155,84 +252,76 @@ fn main() {
     let (tx, rx) = mpsc::channel::<ComputeResult>();
 
     for chunk in chunks {
+        let t = thread::Builder::new().stack_size(TOTAL_CITIES + (1024 * 1024 * 10));
+
         let tx = tx.clone();
-        handles.push(thread::spawn(move || {
-            let mut file = OpenOptions::new()
-                .read(true)
-                .open(MEASUREMENT_FILE)
-                .unwrap();
 
-            file.seek(SeekFrom::Start(chunk.start)).unwrap();
+        handles.push(
+            t.spawn(move || {
+                let mut file = OpenOptions::new()
+                    .read(true)
+                    .open(MEASUREMENT_FILE)
+                    .unwrap();
 
-            let mut reader = BufReader::with_capacity(4194304, file);
+                file.seek(SeekFrom::Start(chunk.start)).unwrap();
 
-            let mut weather_data = HashMap::<String, (f32, f32, f32, f32)>::new();
+                let mut reader = BufReader::with_capacity(BUFF_CAPACITY, file);
 
-            let mut consumed_bytes = 0;
+                let mut weather_data = WeatherHashMap::new();
 
-            let mut consumed_lines = 0;
+                let mut consumed_bytes = 0;
 
-            let mut line = String::new();
+                let mut consumed_lines = 0;
 
-            loop {
-                let size = match reader.read_until(b'\n', unsafe { line.as_mut_vec() }) {
-                    Ok(s) => s,
-                    _ => panic!("failed to read line"),
-                };
-
-                if size == 0 {
-                    break;
-                }
-
-                consumed_bytes += size;
-
-                consumed_lines += 1;
-
-                let mut delim_idx = line.len() - 5;
-
-                let bytes = line.as_bytes();
+                let mut line = String::new();
 
                 loop {
-                    if bytes[delim_idx] == b';' {
+                    let size = match reader.read_until(b'\n', unsafe { line.as_mut_vec() }) {
+                        Ok(s) => s,
+                        _ => panic!("failed to read line"),
+                    };
+
+                    if size == 0 {
                         break;
                     }
-                    delim_idx -= 1;
+
+                    consumed_bytes += size;
+
+                    consumed_lines += 1;
+
+                    let mut delim_idx = line.len() - 5;
+
+                    let bytes = line.as_bytes();
+
+                    loop {
+                        if bytes[delim_idx] == b';' {
+                            break;
+                        }
+                        delim_idx -= 1;
+                    }
+
+                    let city = &line[0..delim_idx];
+
+                    let temp = string_to_float(line[delim_idx + 1..(line.len() - 1)].as_bytes());
+
+                    weather_data.entry(city.as_bytes(), temp);
+
+                    if consumed_bytes == chunk.chunk_size as usize {
+                        break;
+                    }
+
+                    line.clear();
                 }
 
-                let city = &line[0..delim_idx];
-
-                let temp = string_to_float(line[delim_idx + 1..(line.len() - 1)].as_bytes());
-
-                match weather_data.get_mut(city) {
-                    Some(entry) => {
-                        if temp < entry.0 {
-                            entry.0 = temp;
-                        }
-                        if temp > entry.2 {
-                            entry.2 = temp;
-                        }
-                        entry.1 += temp;
-                        entry.3 += 1.0;
-                    }
-                    None => {
-                        weather_data.insert(city.to_string(), (temp, temp, temp, 1.0));
-                    }
-                };
-
-                if consumed_bytes == chunk.chunk_size as usize {
-                    break;
-                }
-
-                line.clear();
-            }
-
-            tx.send(ComputeResult {
-                consumed_bytes,
-                consumed_lines,
-                weather_data,
+                tx.send(ComputeResult {
+                    consumed_bytes,
+                    consumed_lines,
+                    weather_data,
+                })
+                .unwrap();
             })
-            .unwrap();
-        }));
+            .unwrap(),
+        );
     }
 
     let mut consumed_bytes = 0;
@@ -245,21 +334,29 @@ fn main() {
 
         consumed_bytes += compute.consumed_bytes;
         consumed_lines += compute.consumed_lines;
-        for (city, readings) in compute.weather_data {
-            if let Some(entry) = weather_data.get_mut(&city) {
-                if readings.0 < entry.0 {
-                    entry.0 = readings.0;
+        for idx in compute.weather_data.occupied_indexes {
+            let station_entry = &compute.weather_data.data[idx];
+
+            let city = station_entry.name_string();
+            if let Some(entry) = weather_data.get_mut(city) {
+                if station_entry.min < entry.0 {
+                    entry.0 = station_entry.min;
                 }
 
-                if readings.2 > entry.2 {
-                    entry.2 = readings.2;
+                if station_entry.max > entry.2 {
+                    entry.2 = station_entry.max;
                 }
-                entry.1 += readings.1;
-                entry.3 += readings.3;
+                entry.1 += station_entry.sum;
+                entry.3 += station_entry.count;
             } else {
                 weather_data.insert(
                     city.to_string(),
-                    (readings.0, readings.1, readings.2, readings.3),
+                    (
+                        station_entry.min,
+                        station_entry.sum,
+                        station_entry.max,
+                        station_entry.count,
+                    ),
                 );
             }
         }

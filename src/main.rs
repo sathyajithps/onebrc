@@ -2,15 +2,15 @@ use std::sync::mpsc;
 use std::{
     collections::HashMap,
     fs::{self, OpenOptions},
-    io::{BufRead, BufReader, Read, Seek, SeekFrom},
+    io::{Read, Seek, SeekFrom},
     thread::{self},
 };
 
 // Number of threads that will be spawned to process chunks
-const THREADS: u64 = 13;
+const THREADS: u64 = 11;
 const MEASUREMENT_FILE: &'static str = "measurements.txt";
 const TOTAL_CITIES: usize = 10_000;
-const BUFF_CAPACITY: usize = 4194304;
+const BUFF_CAPACITY: usize = 2097152;
 
 // Result from each thread
 struct ComputeResult {
@@ -252,7 +252,8 @@ fn main() {
     let (tx, rx) = mpsc::channel::<ComputeResult>();
 
     for chunk in chunks {
-        let t = thread::Builder::new().stack_size(TOTAL_CITIES + (1024 * 1024 * 10));
+        let t = thread::Builder::new()
+            .stack_size((BUFF_CAPACITY * 2) + TOTAL_CITIES + (1024 * 1024 * 8));
 
         let tx = tx.clone();
 
@@ -263,9 +264,7 @@ fn main() {
                     .open(MEASUREMENT_FILE)
                     .unwrap();
 
-                file.seek(SeekFrom::Start(chunk.start)).unwrap();
-
-                let mut reader = BufReader::with_capacity(BUFF_CAPACITY, file);
+                let mut buffer = [0u8; BUFF_CAPACITY];
 
                 let mut weather_data = WeatherHashMap::new();
 
@@ -273,44 +272,56 @@ fn main() {
 
                 let mut consumed_lines = 0;
 
-                let mut line = String::new();
+                let mut file_read_at = chunk.start;
 
-                loop {
-                    let size = match reader.read_until(b'\n', unsafe { line.as_mut_vec() }) {
-                        Ok(s) => s,
-                        _ => panic!("failed to read line"),
-                    };
+                file.seek(SeekFrom::Start(file_read_at)).unwrap();
 
-                    if size == 0 {
-                        break;
-                    }
+                'outer: loop {
+                    file.read(&mut buffer).unwrap();
 
-                    consumed_bytes += size;
+                    let mut last = 0;
 
-                    consumed_lines += 1;
+                    let mut idx = 5;
 
-                    let mut delim_idx = line.len() - 5;
-
-                    let bytes = line.as_bytes();
-
-                    loop {
-                        if bytes[delim_idx] == b';' {
-                            break;
+                    while idx < BUFF_CAPACITY {
+                        if buffer[idx] != b'\n' {
+                            idx += 1;
+                            continue;
                         }
-                        delim_idx -= 1;
+
+                        let str_buffer = &buffer[last..=idx];
+
+                        let entry_len = str_buffer.len();
+
+                        let mut delim_idx = entry_len - 5;
+
+                        loop {
+                            if str_buffer[delim_idx] == b';' {
+                                break;
+                            }
+                            delim_idx -= 1;
+                        }
+
+                        let temp = string_to_float(&str_buffer[(delim_idx + 1)..(entry_len - 1)]);
+
+                        weather_data.entry(&str_buffer[0..delim_idx], temp);
+
+                        consumed_bytes += entry_len;
+
+                        consumed_lines += 1;
+
+                        if consumed_bytes == chunk.chunk_size as usize {
+                            break 'outer;
+                        }
+
+                        last = idx + 1;
+
+                        idx += 6;
                     }
 
-                    let city = &line[0..delim_idx];
+                    file_read_at = file_read_at + last as u64;
 
-                    let temp = string_to_float(line[delim_idx + 1..(line.len() - 1)].as_bytes());
-
-                    weather_data.entry(city.as_bytes(), temp);
-
-                    if consumed_bytes == chunk.chunk_size as usize {
-                        break;
-                    }
-
-                    line.clear();
+                    file.seek(SeekFrom::Start(file_read_at)).unwrap();
                 }
 
                 tx.send(ComputeResult {
